@@ -3,7 +3,7 @@ package WorkerGate;
 use strict;
 use warnings;
 
-use Errno qw(EAGAIN EWOULDBLOCK EINTR);
+use Errno qw(EAGAIN EWOULDBLOCK EINTR ENOENT);
 use Fcntl qw(:DEFAULT :flock F_GETFD F_SETFD FD_CLOEXEC);
 use File::Path qw(make_path);
 use File::Spec;
@@ -12,12 +12,19 @@ use JSON::PP qw(decode_json encode_json);
 use POSIX qw(WNOHANG _exit strftime);
 use Time::HiRes qw(time sleep);
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 sub new {
     my ($class, %args) = @_;
 
-    my $max_workers = $args{max_workers} // 30;
+    # An environment override lets existing callers retain their old
+    # max_workers argument while operations changes the shared limit once.
+    my $environment_max = exists($ENV{WORKER_GATE_MAX_WORKERS})
+        ? $ENV{WORKER_GATE_MAX_WORKERS} : undef;
+    my $caller_max = exists($args{max_workers})
+        ? $args{max_workers} : undef;
+    my $max_workers = defined($environment_max)
+        ? $environment_max : ($caller_max // 30);
     die "max_workers must be a positive integer\n"
         unless defined($max_workers) && $max_workers =~ /\A[1-9][0-9]*\z/;
 
@@ -47,6 +54,8 @@ sub new {
 
     my $self = bless {
         max_workers => 0 + $max_workers,
+        environment_max => defined($environment_max) ? 1 : 0,
+        max_explicit => defined($environment_max) || defined($caller_max),
         lock_dir    => $lock_dir,
         log_file    => $log_file,
         log_lock_timeout => $log_lock_timeout,
@@ -166,6 +175,41 @@ sub _configuration_path {
     return "$self->{lock_dir}/gate-config.json";
 }
 
+sub _gate_is_idle {
+    my ($self, $other_max) = @_;
+    my $max = $self->{max_workers} > $other_max
+        ? $self->{max_workers} : $other_max;
+
+    for my $slot (1 .. $max) {
+        my $path = $self->_slot_path($slot);
+        my $fh;
+        if (!sysopen($fh, $path, O_RDONLY)) {
+            next if $! == ENOENT;
+            die "Cannot inspect $path: $!\n";
+        }
+        my $free = eval { _flock_nonblocking($fh, LOCK_EX, $path) };
+        my $error = $@;
+        close $fh;
+        die $error if length $error;
+        return 0 unless $free;
+    }
+
+    opendir my $directory, $self->{lock_dir}
+        or die "Cannot scan $self->{lock_dir}: $!\n";
+    my @queue = grep { /\Aqueue-.*\.lock\z/ } readdir $directory;
+    closedir $directory;
+    for my $file (@queue) {
+        my $path = "$self->{lock_dir}/$file";
+        sysopen(my $fh, $path, O_RDONLY) or next;
+        my $free = eval { _flock_nonblocking($fh, LOCK_EX, $path) };
+        my $error = $@;
+        close $fh;
+        die $error if length $error;
+        return 0 unless $free;
+    }
+    return 1;
+}
+
 sub _read_json_path {
     my ($path) = @_;
     open my $fh, '<', $path or die "Cannot read $path: $!\n";
@@ -211,12 +255,30 @@ sub _ensure_configuration {
         my $configuration = _read_json_path($path);
         die "Unsupported WorkerGate configuration format in $path\n"
             unless ($configuration->{format_version} // 0) == 1;
-        die "WorkerGate configuration mismatch: max_workers is $configuration->{max_workers}, requested $self->{max_workers}\n"
-            unless defined($configuration->{max_workers})
-                && $configuration->{max_workers} == $self->{max_workers};
+        my $max_changed;
+        if (!defined($configuration->{max_workers})
+            || $configuration->{max_workers} != $self->{max_workers}) {
+            if (!$self->{max_explicit}
+                && defined($configuration->{max_workers})
+                && $configuration->{max_workers} =~ /\A[1-9][0-9]*\z/) {
+                # Omitting max_workers means “use the shared deployment value”.
+                $self->{max_workers} = 0 + $configuration->{max_workers};
+            } else {
+            die "WorkerGate configuration mismatch: max_workers is $configuration->{max_workers}, requested $self->{max_workers}\n"
+                unless $self->{environment_max};
+            my $old_max = $configuration->{max_workers} // 0;
+            die "Cannot change max_workers while the gate is active; stop old masters and drain workers first\n"
+                unless $self->_gate_is_idle($old_max);
+            $max_changed = 1;
+            }
+        }
         die "WorkerGate configuration mismatch: log_file is '$configuration->{log_file}', requested '$self->{log_file}'\n"
             unless defined($configuration->{log_file})
                 && $configuration->{log_file} eq $self->{log_file};
+        if ($max_changed) {
+            $configuration->{max_workers} = $self->{max_workers};
+            $self->_write_json_atomic($path, $configuration);
+        }
     } else {
         $self->_write_json_atomic($path, {
             format_version => 1,

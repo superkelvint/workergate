@@ -47,4 +47,32 @@ $output = qx{$^X bin/worker-gate-status --lock-dir "$fixture->{lock_dir}" --max-
 is($? >> 8, 2, 'dashboard rejects a mismatched explicit capacity');
 like($output, qr/configuration mismatch/i, 'dashboard explains capacity mismatch');
 
+{
+    local $ENV{WORKER_GATE_MAX_WORKERS} = 3;
+    my $overridden = WorkerGate->new(
+        lock_dir => $fixture->{lock_dir}, log_file => $fixture->{log_file}, max_workers => 2,
+    );
+    is($overridden->{max_workers}, 3, 'environment override supersedes old per-caller value');
+}
+
+my $central_default = WorkerGate->new(
+    lock_dir => $fixture->{lock_dir}, log_file => $fixture->{log_file},
+);
+is($central_default->{max_workers}, 3, 'callers can omit max_workers and use shared configuration');
+
+my $active = WorkerGate->new(
+    lock_dir => $fixture->{lock_dir}, log_file => $fixture->{log_file}, max_workers => 3,
+);
+$active->launch(directory => '.', command => [$^X, '-e', 'select undef,undef,undef,0.2'], label => 'active-config');
+{
+    local $ENV{WORKER_GATE_MAX_WORKERS} = 4;
+    eval {
+        WorkerGate->new(
+            lock_dir => $fixture->{lock_dir}, log_file => $fixture->{log_file}, max_workers => 3,
+        );
+    };
+    like($@, qr/active.*stop old masters/i, 'capacity cannot change while workers are active');
+}
+$active->wait_all;
+
 done_testing;

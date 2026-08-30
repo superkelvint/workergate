@@ -179,9 +179,7 @@ Then replace the old `foreach` block with this version. The gate is created
 once, before the loop—not once for every store.
 
 ```perl
-my $gate = WorkerGate->new(
-    max_workers => 30,
-);
+my $gate = WorkerGate->new;
 
 foreach $event (@events)
 {
@@ -272,9 +270,7 @@ use WorkerGate;
 Then replace its old `foreach` block with:
 
 ```perl
-my $gate = WorkerGate->new(
-    max_workers => 30,
-);
+my $gate = WorkerGate->new;
 
 foreach $event (@events)
 {
@@ -338,7 +334,6 @@ same paths to every `WorkerGate` instance:
 
 ```perl
 my $gate = WorkerGate->new(
-    max_workers => 30,
     lock_dir    => '/home/shared_cgi/var/worker-gate',
     log_file    => '/home/shared_cgi/var/worker-gate.jsonl',
 );
@@ -355,6 +350,56 @@ sudo install -o www-data -g www-data -m 0640 /dev/null /home/shared_cgi/var/work
 The paths must be absolute. The first program creates `gate-config.json` in the
 lock directory. Later programs reject a different `max_workers` or `log_file`
 instead of silently forming an incoherent gate or split audit trail.
+
+To change capacity without editing every caller, set `WORKER_GATE_MAX_WORKERS`
+once in the shared service/cron/CGI environment. It overrides legacy per-caller
+values, updates `gate-config.json` when the gate is idle, and refuses to change
+the setting while workers or waiters are active. Stop old masters, let workers
+drain, then restart them with the new environment value.
+
+For example, changing the deployment from 30 to 50 workers is one environment
+change:
+
+```sh
+export WORKER_GATE_MAX_WORKERS=50
+```
+
+In systemd, cron, Apache/FastCGI, or the process supervisor, set that variable
+in the shared service environment so every master inherits it.
+
+### Crontab example
+
+Edit the crontab:
+
+```sh
+crontab -e
+```
+
+Put the variable assignment near the top of that crontab. In a crontab it is a
+plain assignment—do not write `export`:
+
+```cron
+SHELL=/bin/sh
+PATH=/usr/bin:/bin
+WORKER_GATE_MAX_WORKERS=50
+
+# Use absolute paths; cron does not load your interactive shell profile.
+*/5 * * * * /usr/bin/perl -I/home/shared_cgi/lib /home/shared_cgi/bin/multi_store_order_process_amazon.cgi >>/home/shared_cgi/var/amazon.cron.log 2>&1
+*/5 * * * * /usr/bin/perl -I/home/shared_cgi/lib /home/shared_cgi/bin/multi_store_update_process_ebay.cgi >>/home/shared_cgi/var/ebay.cron.log 2>&1
+```
+
+The variable line applies to every job in that crontab, so Amazon, eBay, and
+storefront masters all use the same 50-worker limit. If you use `/etc/cron.d`
+instead of a user crontab, add the username field to each job line:
+
+```cron
+WORKER_GATE_MAX_WORKERS=50
+*/5 * * * * www-data /usr/bin/perl -I/home/shared_cgi/lib /home/shared_cgi/bin/multi_store_order_process_amazon.cgi
+```
+
+After changing the value, stop the old cron-launched masters, let their workers
+drain, and allow the new jobs to start. WorkerGate will update the shared
+`gate-config.json` only when the gate is idle.
 
 ## See what is running
 
