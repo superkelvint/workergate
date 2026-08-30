@@ -189,6 +189,8 @@ foreach $event (@events)
 
     $path = "/home/$event/public_html/online_store";
 
+    # Optional: keep this only if eBay or another external API needs launches
+    # to be staggered. WorkerGate limits concurrent workers, not API rate.
     sleep(4);
 
     !-e "$path/ebay_update_queue.cgi" and next;
@@ -280,6 +282,8 @@ foreach $event (@events)
 
     $path = "/home/$event/public_html/online_store";
 
+    # Optional: keep this only if Amazon or another external API needs launches
+    # to be staggered. WorkerGate limits concurrent workers, not API rate.
     sleep(8);
 
     !-e "$path/order_process.cgi" and next;
