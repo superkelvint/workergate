@@ -1,0 +1,190 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Fcntl qw(:DEFAULT :flock);
+use Errno qw(EAGAIN EWOULDBLOCK EINTR ENOENT);
+use File::Spec;
+use Getopt::Long qw(GetOptions);
+use JSON::PP qw(decode_json);
+use POSIX qw(strftime);
+use Time::HiRes qw(sleep);
+
+my %option = (
+    lock_dir => '/run/lock/store-worker-gate',
+    interval => 2,
+);
+
+GetOptions(
+    'lock-dir=s' => \$option{lock_dir},
+    'max-workers=i' => sub {
+        $option{max} = $_[1];
+        $option{max_was_set} = 1;
+    },
+    'watch|w' => \$option{watch},
+    'interval=f' => \$option{interval},
+    'help|h' => \$option{help},
+) or usage(2);
+usage(0) if $option{help};
+sub fail {
+    my ($message) = @_;
+    warn $message;
+    exit 2;
+}
+fail("--interval must be positive\n") unless $option{interval} > 0;
+fail("--lock-dir must be an absolute path\n")
+    unless File::Spec->file_name_is_absolute($option{lock_dir});
+fail("lock directory '$option{lock_dir}' does not exist\n") unless -d $option{lock_dir};
+
+if ($option{max_was_set}) {
+    fail("--max-workers must be a positive integer\n") unless $option{max} > 0;
+}
+
+my $configuration_path = "$option{lock_dir}/gate-config.json";
+if (-e $configuration_path) {
+    my $configuration = read_json_file($configuration_path)
+        or fail("cannot decode gate configuration $configuration_path\n");
+    fail("unsupported gate configuration format\n")
+        unless ($configuration->{format_version} // 0) == 1;
+    my $configured_max = $configuration->{max_workers};
+    fail("invalid max_workers in gate configuration\n")
+        unless defined($configured_max) && $configured_max =~ /\A[1-9][0-9]*\z/;
+    if ($option{max_was_set} && $option{max} != $configured_max) {
+        fail("WorkerGate configuration mismatch: max_workers is $configured_max, requested $option{max}\n");
+    }
+    $option{max} = 0 + $configured_max;
+} else {
+    $option{max} //= 30;
+}
+
+sub usage {
+    my ($status) = @_;
+    print <<'USAGE';
+Usage: worker-gate-status [options]
+  --lock-dir DIR       shared gate directory
+  --max-workers N      number of slots (default: 30)
+  -w, --watch          refresh continuously
+  --interval SECONDS   watch refresh interval (default: 2)
+  -h, --help           show this help
+USAGE
+    exit $status;
+}
+
+sub read_json_file {
+    my ($path) = @_;
+    open my $fh, '<', $path or return;
+    local $/;
+    my $text = <$fh>;
+    close $fh;
+    my $data = eval { decode_json($text // '') };
+    return ref($data) eq 'HASH' ? $data : undef;
+}
+
+sub try_exclusive_lock {
+    my ($fh, $path) = @_;
+    while (1) {
+        return 1 if flock($fh, LOCK_EX | LOCK_NB);
+        my $error = 0 + $!;
+        my $message = "$!";
+        next if $error == EINTR;
+        return 0 if $error == EWOULDBLOCK || $error == EAGAIN;
+        die "cannot lock $path: $message\n";
+    }
+}
+
+sub snapshot {
+    my @running;
+    my @busy;
+
+    for my $slot (1 .. $option{max}) {
+        my $lock = sprintf '%s/slot-%02d.lock', $option{lock_dir}, $slot;
+        my $fh;
+        if (!sysopen($fh, $lock, O_RDONLY)) {
+            next if $! == ENOENT;
+            die "cannot inspect $lock: $!\n";
+        }
+        if (try_exclusive_lock($fh, $lock)) {
+            flock($fh, LOCK_UN);
+        } else {
+            push @busy, $slot;
+            my $metadata = sprintf '%s/slot-%02d.json', $option{lock_dir}, $slot;
+            my $job = read_json_file($metadata) || {};
+            $job->{slot} = $slot;
+            push @running, $job;
+        }
+        close $fh;
+    }
+
+    my @queued;
+    opendir my $directory, $option{lock_dir}
+        or die "cannot read $option{lock_dir}: $!\n";
+    my @queue_files = grep { /\Aqueue-.*\.lock\z/ } readdir $directory;
+    closedir $directory;
+    for my $file (@queue_files) {
+        my $path = "$option{lock_dir}/$file";
+        sysopen(my $fh, $path, O_RDONLY) or next;
+        if (try_exclusive_lock($fh, $path)) {
+            flock($fh, LOCK_UN);
+            close $fh;
+            next;
+        }
+        my $job = read_json_file($path) || {};
+        push @queued, $job;
+        close $fh;
+    }
+
+    my %running_job = map {
+        defined($_->{job_id}) ? ($_->{job_id} => 1) : ()
+    } @running;
+    @queued = grep {
+        !defined($_->{job_id}) || !$running_job{$_->{job_id}}
+    } @queued;
+
+    @running = sort { ($a->{slot} // 0) <=> ($b->{slot} // 0) } @running;
+    @queued = sort { ($a->{queued_at} // 0) <=> ($b->{queued_at} // 0) } @queued;
+    return (\@busy, \@running, \@queued);
+}
+
+while (1) {
+    print "\033[2J\033[H" if $option{watch} && -t STDOUT;
+    my ($busy, $running, $queued) = snapshot();
+    my %busy = map { $_ => 1 } @$busy;
+    my $free = $option{max} - @$busy;
+
+    print "============================================================\n";
+    print " Worker Gate Status\n ", strftime('%Y-%m-%d %H:%M:%S', localtime), "\n";
+    print "============================================================\n\n";
+    printf "Capacity : %d\nRunning  : %d\nFree     : %d\nQueued   : %d\n",
+        $option{max}, scalar(@$busy), $free, scalar(@$queued);
+    print "\nSlots    : ", join('', map { $busy{$_} ? 'X' : '.' } 1 .. $option{max}), "\n";
+    print "           X = occupied, . = free\n\nRUNNING\n";
+    print "------------------------------------------------------------\n";
+    if (!@$running) {
+        print "(none)\n";
+    } else {
+        for my $job (@$running) {
+            my $started = defined $job->{started_at}
+                ? strftime('%Y-%m-%d %H:%M:%S', localtime($job->{started_at})) : '';
+            printf "slot=%-2s pid=%-7s %-19s %s\n",
+                $job->{slot} // '?', $job->{pid} // '?', $started,
+                $job->{label} // $job->{job_id} // '(metadata pending)';
+        }
+    }
+
+    print "\nQUEUED / WAITING\n------------------------------------------------------------\n";
+    if (!@$queued) {
+        print "(none)\n";
+    } else {
+        for my $job (@$queued) {
+            my $queued_at = defined $job->{queued_at}
+                ? strftime('%Y-%m-%d %H:%M:%S', localtime($job->{queued_at})) : '';
+            printf "%-19s %s\n", $queued_at,
+                $job->{label} // $job->{job_id} // '(metadata unavailable)';
+        }
+    }
+    print "\n";
+    last unless $option{watch};
+    print "Refreshing every $option{interval} seconds - Ctrl-C to exit\n";
+    sleep $option{interval};
+}
