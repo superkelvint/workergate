@@ -439,8 +439,53 @@ tail -f /var/log/store-worker-gate.jsonl
 To watch only when jobs start or finish, filter the live output:
 
 ```sh
-tail -f /var/log/store-worker-gate.jsonl | grep STARTED
-tail -f /var/log/store-worker-gate.jsonl | grep FINISHED
+tail -f /var/log/store-worker-gate.jsonl | grep --line-buffered STARTED
+tail -f /var/log/store-worker-gate.jsonl | grep --line-buffered FINISHED
+```
+
+The log line contains the job label, so you can search for a particular store
+or marketplace without caring about capitalization:
+
+```sh
+tail -f /var/log/store-worker-gate.jsonl | grep --line-buffered -i amazon
+tail -f /var/log/store-worker-gate.jsonl | grep --line-buffered -i ebay
+```
+
+To watch more than one marketplace, use an extended regular expression:
+
+```sh
+tail -f /var/log/store-worker-gate.jsonl \
+  | grep --line-buffered -i -E 'amazon|ebay'
+```
+
+`grep` searches the raw JSONL text. Use `jq` when you want to select fields,
+filter events, or reformat the output. For example, pretty-print the JSON:
+
+```sh
+jq . /var/log/store-worker-gate.jsonl | less
+```
+
+Show only a few useful fields as a readable line:
+
+```sh
+jq -r '"\(.time) \(.event) \(.label) (pid \(.pid), slot \(.slot))"' \
+  /var/log/store-worker-gate.jsonl
+```
+
+Show starts for Amazon jobs as tab-separated columns:
+
+```sh
+jq -r 'select(.event == "STARTED" and (.label | test("amazon"; "i")))
+  | [.time, .event, .label] | @tsv' \
+  /var/log/store-worker-gate.jsonl
+```
+
+The same formatting works for live output. `--unbuffered` makes each event
+appear as soon as it is read:
+
+```sh
+tail -f /var/log/store-worker-gate.jsonl \
+  | jq --unbuffered -r '"\(.time) \(.event): \(.label)"'
 ```
 
 The account reading the log must have permission to read the file. Press
