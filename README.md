@@ -427,6 +427,25 @@ worker-gate-status \
 
 Press `Ctrl-C` to stop watching.
 
+### Watch the event log live
+
+WorkerGate writes lifecycle events to `/var/log/store-worker-gate.jsonl`. To
+watch all new events as they are written:
+
+```sh
+tail -f /var/log/store-worker-gate.jsonl
+```
+
+To watch only when jobs start or finish, filter the live output:
+
+```sh
+tail -f /var/log/store-worker-gate.jsonl | grep STARTED
+tail -f /var/log/store-worker-gate.jsonl | grep FINISHED
+```
+
+The account reading the log must have permission to read the file. Press
+`Ctrl-C` to stop watching.
+
 ## Timeouts and hardening options
 
 By default `launch()` preserves the original behavior and can wait without a
